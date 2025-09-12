@@ -868,8 +868,6 @@ megatron的分布式优化器是十分重要的一个组件，其既是分布式
 ![img_3.png](img_3.png)
 上图的流程大致为如下逻辑：
 
-
-
 上图的流程大致为如下逻辑：
 
 * 从`main_params`将权重参数拷贝到`model_params`，然后使用`model_params`进行`forward`计算【这里的`main_params`保存的权重参数的精度为FP32，而`model_params`的精度为FP16】
@@ -877,3 +875,110 @@ megatron的分布式优化器是十分重要的一个组件，其既是分布式
 * 将scaled\_grad【FP16】拷贝到训练进程的grad buffer内，进行`reduce-scatter`，让这个rank持有的模型参数的DP组内有一个rank能有一个batch汇总平均过的梯度【FP16】
 * 将上一步`reduce-scatter`汇总过的梯度【FP16】unscale为精度为FP32的梯度（unscale时还需要进行clip之类的梯度缩放操作，让梯度不要过大【避免梯度爆炸】），然后执行`optimizer.step()`对**这个rank所持有的分布式优化器内持有的优化器状态的shard所拥有的模型参数进行更新**【这里很绕，需要读者好好捋一捋，下面分布式优化器更新过程里会有进一步的阐述，但我们在这里需要记住一个概念——**由于模型并行的存在，每个rank内的model只是完整model的一个碎片**】
 * 所有持有相同完整模型的碎片的rank【即一个DP通讯组里的所有rank】调用`all-gather`将上一步更新过的部分参数汇总起来，这样这个DP组里的所有rank就都有这个model碎片的完整的更新过的参数了
+
+## 代码流程：
+
+下面的`trian_step`代码为core0.9版本，在大于23.08分支后对梯度的同步与对分布式优化器状态的all-gather都被“隐藏”了起来。我们接下来会把它们找出来，然后仔细讲一讲。
+
+```python
+def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config):
+    """Single training step."""
+    args = get_args()
+    timers = get_timers()
+
+    """ 清除梯度 """
+    for model_chunk in model:
+        model_chunk.zero_grad_buffer()
+    optimizer.zero_grad()
+
+    """ 前、反向传播 【reduce-scatter梯度被隐藏在了forward_backward_func这个函数的最后】"""
+    forward_backward_func = get_forward_backward_func()
+    losses_reduced = forward_backward_func(
+        forward_step_func=forward_step_func,
+        data_iterator=data_iterator,
+        model=model,
+        num_microbatches=get_num_microbatches(),
+        seq_length=args.seq_length,
+        micro_batch_size=args.micro_batch_size,
+        decoder_seq_length=args.decoder_seq_length,
+        forward_only=False)
+
+    """ 释放fwd-bwd使用的cache """
+    if args.empty_unused_memory_level >= 1:
+        torch.cuda.empty_cache()
+
+    ... """ 可视化梯度 """
+
+    """ 更新参数 【all-gather优化器状态被隐藏在了step函数的最后】"""
+    timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
+    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    timers('optimizer').stop()
+
+    ... """ 可视化adam优化器的动量 """ 
+
+    """ 更新学习率 """
+    if update_successful:
+        increment = get_num_microbatches() * args.micro_batch_size * args.data_parallel_size
+        opt_param_scheduler.step(increment=increment)
+        skipped_iter = 0
+    else:
+        skipped_iter = 1
+```
+
+## 参数更新过程：
+
+下图为`DistributedOptimizer`进行参数更新的过程【**记住，这里更新的参数只是完整model的一个碎片——即一个rank内持有的model的参数的更新**】：
+
+`grad buffer`是megatron进行梯度同步的一个buffer，所有的梯度进行发送的时候都会拷贝到buffer内【这样效率高】，一整个`grad buffer`构成这张卡的model的全部梯度。
+
+DP组内四张卡的`grad buffer`内分别是这个`global batch size`内各自四分之一数据计算出的梯度。
+![img_4.png](img_4.png)
+![img_5.png](img_5.png)
+![img_6.png](img_6.png)
+值得特别注意的点是：step3到step4的all-gather步骤同步的是BF16的模型参数，思考一下原因【因为每个分布式优化器的main params只有一部分优化器状态，他无法all-gather FP32精度的完整模型参数】。
+
+所以megatron也是在每个分布式优化器step完之后就直接把FP32精度的模型参数又更新到了自己BF16精度的model params上去了（对应step3），然后对这个半精度的模型参数进行all-gather。
+
+
+## 梯度同步：
+
+从上面的图中我们看大了`reduce-scatter`进行梯度同步，同时我们也说了这个调用被隐藏进了fwd-bwd函数之中，接下来我们就看看其实现：
+```python
+def forward_backward_pipelining_without_interleaving(......):
+    if config.timers is not None:
+        config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
+   
+    ...... """ 进行流水线forward和backward 【前文已经讲过，这里不再展示】"""
+
+    """ 进行梯度同步 """
+    if config.finalize_model_grads_func is not None and not forward_only:
+        ...
+
+        # Finalize model grads (perform full grad all-reduce / reduce-scatter for data parallelism, 
+        # layernorm all-reduce for sequence parallelism, and embedding all-reduce for pipeline parallelism).
+        """ 下面的函数就是进行一系列梯度同步操作的函数 """
+        config.finalize_model_grads_func([model], total_num_tokens if config.calculate_per_token_loss else None)
+
+    if config.timers is not None:
+        config.timers('forward-backward').stop()
+
+    """ 这个返回值就是用于打印的lm loss """
+    return forward_data_store
+```
+```python
+def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torch.Tensor] = None):
+    config = get_model_config(model[0])
+
+    """ 遍历模型块，同步所有模型梯度，具体是调用reduce-scatter还是all-reduce取决于是否使用了分布式优化器 【启用调用reduce-scatter】"""
+    for model_chunk in model:
+        model_chunk.finish_grad_sync()
+
+    """ 同步layernorm的梯度 【序列并行专用】"""
+    _allreduce_layernorm_grads(model, config)
+
+    """ 同步Embedding【包含词嵌入矩阵和位置编码矩阵】的梯度 【只有流水线的first_stage和last_stage才需要】 """
+    _allreduce_embedding_grads(model, config)
+ 
+    if num_tokens is not None:
+        """ 在tokens维度上缩放梯度 【细节读者自己看代码这里不展示】"""
+```
