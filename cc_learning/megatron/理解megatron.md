@@ -939,10 +939,10 @@ DP组内四张卡的`grad buffer`内分别是这个`global batch size`内各自�
 
 所以megatron也是在每个分布式优化器step完之后就直接把FP32精度的模型参数又更新到了自己BF16精度的model params上去了（对应step3），然后对这个半精度的模型参数进行all-gather。
 
-
 ## 梯度同步：
 
 从上面的图中我们看大了`reduce-scatter`进行梯度同步，同时我们也说了这个调用被隐藏进了fwd-bwd函数之中，接下来我们就看看其实现：
+
 ```python
 def forward_backward_pipelining_without_interleaving(......):
     if config.timers is not None:
@@ -965,6 +965,7 @@ def forward_backward_pipelining_without_interleaving(......):
     """ 这个返回值就是用于打印的lm loss """
     return forward_data_store
 ```
+
 ```python
 def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torch.Tensor] = None):
     config = get_model_config(model[0])
@@ -981,4 +982,122 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
  
     if num_tokens is not None:
         """ 在tokens维度上缩放梯度 【细节读者自己看代码这里不展示】"""
+```
+
+上面的代码我们看到了所有的梯度都是在哪里开始同步的，接下来我们着重看看模型的梯度调用集合通信算子进行同步的细节:【下面的bucket的含义是模型的参数被按bucket切分成了一个个小的块，这样可以抽象出来以便同步】
+
+```python
+class _ParamAndGradBucketGroup:
+    ......
+    def start_param_sync(self, force_sync: bool = False):
+        ... """ 下一节讲优化器状态同步的时候展开讲述 """
+    def finish_param_sync(self, skip_next_bucket_dispatch: bool = False):
+        ...
+
+    def start_grad_sync(self):
+        if self.ddp_config.check_for_nan_in_grad:
+            self.check_for_nan_in_grad()
+
+        """ 
+        由于我们在fwd-bwd得到loss进行反向传播计算梯度的过程中并没有进行DP维度的平均，所以我们需要在这里进行梯度的平均缩放，
+        下面的bucket.gradient_scaling_factor的值是 1.0 / DP size。【老版本代码里没有做这个判断1.0减少计算的优化】
+        """
+        for bucket in self.buckets:
+            if bucket.gradient_scaling_factor != 1.0:
+                bucket.grad_data *= bucket.gradient_scaling_factor
+
+        # Decide reduce_op.
+        reduce_op = torch.distributed.ReduceOp.SUM
+        if self.ddp_config.average_in_collective:
+            reduce_op = torch.distributed.ReduceOp.AVG
+        """ 
+        下面就是进行梯度同步的操作，可以看到if else是按有没有启动分布式优化器来区分的，
+        启动了就调用reduce-scatter【对应我上面的图】，然后这个集合通信是否是异步的是
+        根据用户有没有指定overlap_grad_reduce这个参数决定的，指定了就会异步【all-gather参数也是一样的道理，不过这两个参数不是同一个】。
+        """
+        async_op = self.ddp_config.overlap_grad_reduce
+        with _coalescing_manager(self.data_parallel_group, async_ops=async_op) as cm:
+            for bucket in self.buckets:
+                if self.ddp_config.use_distributed_optimizer:
+                    local_data_view = shard_buffer(bucket.grad_data, self.data_parallel_world_size)[self.data_parallel_rank]
+                    torch.distributed._reduce_scatter_base(......)
+                else:
+                    torch.distributed.all_reduce(......)
+        if async_op:
+            self.grad_reduce_handle = cm
+        else:
+            self.grad_reduce_handle = None
+
+    def finish_grad_sync(self):
+        """ 如果没有启动异步集合通信算子，那么下面的.wait()操作就不需要做了（在算子内部就已经做了） """
+        self.param_gather_dispatched = False
+        if not self.ddp_config.overlap_grad_reduce:
+            self.start_grad_sync() """ 调用上面的梯度同步函数 """
+            return
+        self.grad_reduce_handle.wait()
+        self.grad_reduce_handle = None
+```
+
+从上面的这个类里面我们不只看到了梯度的同步函数，还看到了参数的同步函数。在老版本的代码里这两个模块是被分开了的，现在被结合在一个类里，可读性好了很多。通过上面的grad_sync操作，我们就完成了梯度的同步，接下来我们看看优化器更新完参数后如何all-gather对方的优化器状态。
+
+
+## 优化器状态同步：
+
+优化器状态同步和梯度同步的代码逻辑很像，下面就不再过多的写注释了，相信读者可以通过自己的能力读懂代码，我下面主要讲这个`start_param_sync()`在哪里调用的.
+```python
+class DistributedOptimizer(MixedPrecisionOptimizer):
+    ......
+    @torch.no_grad()
+    def step_with_ready_grads(self) -> bool:
+        """ 
+        这里有个多态，具体的调用流程比较绕：分布式优化器没有重写混合精度优化器的step函数，所以optimizer.step()会调用到混合精度的step函数里，然后混合精度
+        优化器的step中会调用step_with_ready_grads()，这时会因为多态先调用到分布式优化器的对应函数，然后这个函数里又调用了其父类的对应函数，混合精度的对应
+        函数里调用了最后的pytorch的optimizer.step()完成优化器状态的更新。然后执行完后就会回到分布式优化器的step_with_ready_grads中来进行all-gather操作。
+        """
+        update_successful = super().step_with_ready_grads()
+
+        # If there is no FP8 parameters, this will do nothing.
+        self._update_fp8_scale_inv_and_amax()
+
+        """ 
+        注意，这里是同步算子调用的过程，如果开启了overlap_param_gather参数，那么这个gather操作会被放到下一个iteration的
+        train_step开头的zero_grad()函数中依靠调用finish_param_sync实现all-gather。
+        """
+        if not self.ddp_config.overlap_param_gather:
+            for model_chunk in self.model_chunks:
+                model_chunk.start_param_sync()
+
+        return update_successful
+
+
+class _ParamAndGradBucketGroup:  
+    def start_param_sync(self, force_sync: bool = False):
+        ...
+        async_op = self.ddp_config.overlap_param_gather and not force_sync
+        with _coalescing_manager(self.data_parallel_group, async_ops=async_op) as cm:
+            for bucket in self.buckets:
+                local_data_view = shard_buffer(bucket.param_data, self.data_parallel_world_size)[self.data_parallel_rank]
+                torch.distributed._all_gather_base(
+                    bucket.param_data,
+                    local_data_view,
+                    group=self.data_parallel_group,
+                    async_op=async_op,
+                )
+        if async_op:
+            self.param_gather_handle = cm
+        else:
+            self.param_gather_handle = None
+        self.param_gather_dispatched = True
+
+    def finish_param_sync(self, skip_next_bucket_dispatch: bool = False):
+        ...
+        if not self.param_gather_dispatched:
+            self.start_param_sync()
+
+        if self.param_gather_handle is not None:
+            self.param_gather_handle.wait()
+            self.param_gather_handle = None
+            # Dispatch next bucket's asynchronous param AG.
+            if self.next_param_gather_bucket_group is not None and not skip_next_bucket_dispatch:
+                self.next_param_gather_bucket_group.start_param_sync()
 ```
