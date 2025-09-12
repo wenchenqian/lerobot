@@ -4,7 +4,7 @@
 
 pytorch  ddp训练
 
-```
+```python
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
